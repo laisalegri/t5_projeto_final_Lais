@@ -20,7 +20,6 @@ desfaz tudo e as tabelas Silver ficam como estavam.
 Como executar:  python 2_transformar.py   (depois do 1_extrair.py)
 """
 
-
 import warnings
 
 import pandas as pd
@@ -29,66 +28,72 @@ from psycopg2.extras import execute_values
 from banco import conectar
 from config import TAMANHO_BLOCO
 
-# O Pandas avisa que prefere a biblioteca SQLAlchemy, mas funciona com psycopg2.
+# Ignora o aviso do Pandas sobre o uso do psycopg2
 warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy")
 
+
 # ---------------------------------------------------------------------------
-# Funções de conversão (recebem uma coluna inteira do DataFrame)
+# Funções de conversão
 # ---------------------------------------------------------------------------
 
-# REMOVE ESPAÇOS ANTES E DEPOIS, E TRANSFORMA VAZIO EM NAN
 def limpar_texto(coluna):
     """Tira os espaços das pontas. Texto vazio vira NaN (NULL no banco)."""
+
+    # Remove espaços antes e depois do texto
     coluna = coluna.str.strip()
+
+    # Transforma textos vazios em valores ausentes
     return coluna.where(coluna != "")
 
 
-# REMOVE ESPAÇOS ANTES E DEPOIS, SUBSTITUI "," POR "."
-# TRANSFORMA TEXTO PARA NÚMERO 
 def texto_para_decimal(coluna):
     """'1272,97' -> 1272.97. No CSV o decimal é a vírgula. Texto vazio vira NaN."""
+
+    # Troca a vírgula pelo ponto para converter em número
     coluna = coluna.str.strip().str.replace(",", ".")
+
     return pd.to_numeric(
-        coluna, 
-        errors="coerce" # O QUE NÃO TIVER COMO SER CONVERTIDO PARA NÚMERO VIRA NAN
-    ) 
+        coluna,
+        errors="coerce"  # O que não virar número será NaN
+    )
 
 
-# TRANSFORMA TEXTO PARA DATA
 def texto_para_data(coluna):
-    """'17/09/2024' -> data. O format diz que vem dia/mês/ano. Texto vazio vira NaT."""
+    """'17/09/2024' -> data. O formato indica dia/mês/ano."""
+
+    # Converte o texto para data
     return pd.to_datetime(
         coluna.str.strip(),
         format="%d/%m/%Y",
-        errors="coerce"  # O QUE NÃO TIVER COMO SER CONVERTIDO PARA NÚMERO VIRA NAT
+        errors="coerce"  # Datas inválidas viram NaT
     )
-    
+
 
 # ---------------------------------------------------------------------------
-# O que cada tabela lê da Raw e como cada coluna é convertida.
-# A ORDEM importa: silver_viagem (mãe) primeiro, as filhas depois.
+# Configuração das tabelas
 # ---------------------------------------------------------------------------
 
-# DEFINE ORIGEM, DESTINO E TIPOS DOS DADOS DAS COLUNAS NAS TABELAS
+# Define de qual tabela vêm os dados, para qual vão e quais colunas tratar
+# A tabela de viagem vem primeiro porque é a tabela mãe das outras
 TABELAS = [
     {
-        # Indica a tabela de origem dos dados (CAMADA BRONZE)
-        "raw": "raw_viagem", 
-        
-        # Indica a tabela de destino, que receberá os dados tratados (CAMADA SILVER)
-        "silver": "silver_viagem", 
-        
-        # Lista as colunas que devem ser tratadas como texto
+        # Tabela de origem (Raw)
+        "raw": "raw_viagem",
+
+        # Tabela de destino (Silver)
+        "silver": "silver_viagem",
+
+        # Colunas que serão tratadas como texto
         "textos": ["id_viagem", "num_proposta", "situacao", "viagem_urgente", "cod_orgao_superior",
                    "nome_orgao_superior", "nome_viajante", "cargo", "destinos", "motivo"],
-        
-        # Lista as colunas que devem ser convertidas para valores numéricos decimais
+
+        # Colunas que serão convertidas para decimal
         "valores": ["valor_diarias", "valor_passagens", "valor_devolucao", "valor_outros_gastos"],
-        
-        # Lista as colunas que devem ser convertidas para datas
+
+        # Colunas que serão convertidas para data
         "datas": ["data_inicio", "data_fim"],
-        
-        #Lista as colunas que devem ser convertidas para números inteiros
+
+        # Colunas que serão convertidas para inteiros
         "inteiros": [],
     },
     {
@@ -118,92 +123,124 @@ TABELAS = [
     },
 ]
 
-# ESSA FUNÇÃO:
-# pega um bloco de dados da camada Raw, limpa e converte as colunas, 
-# calcula informações adicionais sobre as viagens e prepara os dados para serem inseridos na camada Silver.
+
+# ---------------------------------------------------------------------------
+# Transformação dos dados
+# ---------------------------------------------------------------------------
 
 def transformar(bloco, tabela):
-    """Converte um bloco da Raw. Na viagem, também calcula valor_total e duracao_dias."""
-    for coluna in tabela["textos"]: # TRATAR OS TEXTOS
+    """Converte um bloco da Raw e calcula informações adicionais sobre as viagens."""
+
+    # Trata cada grupo de colunas conforme o tipo de dado
+    for coluna in tabela["textos"]:
         bloco[coluna] = limpar_texto(bloco[coluna])
-    for coluna in tabela["valores"]: # TRATAR OS DECIMAIS
+
+    for coluna in tabela["valores"]:
         bloco[coluna] = texto_para_decimal(bloco[coluna])
-    for coluna in tabela["datas"]: # TRATAR AS DATAS
+
+    for coluna in tabela["datas"]:
         bloco[coluna] = texto_para_data(bloco[coluna])
-    for coluna in tabela["inteiros"]: # TRATAR OS INTEIROS
+
+    for coluna in tabela["inteiros"]:
+        # Converte para número e trata valores inválidos
         bloco[coluna] = pd.to_numeric(bloco[coluna], errors="coerce")
-        
-    # CRIAR NOVAS COLUNAS NA TABELA SILVER_VIAGEM
-    # COLUNAs: "VALOR_TOTAL" E "DURACAO_DIAS"
+
+    # Cria duas colunas calculadas somente para a tabela de viagens
     if tabela["silver"] == "silver_viagem":
+
+        # Calcula o valor total, descontando as devoluções
         bloco["valor_total"] = (
-            bloco["valor_diarias"].fillna(0) # Substitui valores ausentes (NaN) por zero
+            bloco["valor_diarias"].fillna(0)  # Valores vazios são considerados zero
             + bloco["valor_passagens"].fillna(0)
             + bloco["valor_outros_gastos"].fillna(0)
             - bloco["valor_devolucao"].fillna(0)
-        ).round(2) # Arredonda o resultado para duas casas decimais
+        ).round(2)  # Mantém duas casas decimais
+
+        # Calcula a duração da viagem, contando o dia de início
         bloco["duracao_dias"] = (bloco["data_fim"] - bloco["data_inicio"]).dt.days + 1
 
-    # NaN e NaT não são aceitos pelo banco: trocamos por None, que vira NULL
+    # Troca NaN e NaT por None, que será gravado como NULL no banco
     return bloco.astype(object).where(pd.notna(bloco), None)
 
 
-# ESSA FUNÇÃO:
-# é responsável por buscar os dados da camada Raw, 
-# transformá-los e inserir os resultados na camada Silver, em blocos
+# ---------------------------------------------------------------------------
+# Carga da camada Silver
+# ---------------------------------------------------------------------------
 
 def carregar_silver(conexao, tabela):
-    """Lê a Raw em blocos, transforma e grava na Silver. Devolve quantas linhas gravou."""
+    """Lê a Raw em blocos, transforma e grava na Silver."""
+
+    # Junta os nomes das colunas que serão lidas da Raw
     colunas = tabela["textos"] + tabela["valores"] + tabela["datas"] + tabela["inteiros"]
+
+    # Lê os dados em blocos para economizar memória
     blocos = pd.read_sql(
         f"SELECT {', '.join(colunas)} FROM {tabela['raw']}", conexao, chunksize=TAMANHO_BLOCO
     )
+
     cursor = conexao.cursor()
     total = 0
+
     for bloco in blocos:
+        # Limpa e converte os dados antes de inserir
         bloco = transformar(bloco, tabela)
+
+        # Prepara as linhas para a inserção no banco
         linhas = list(bloco.itertuples(index=False, name=None))
+
+        # Insere várias linhas de uma vez
         execute_values(
             cursor,
             f"INSERT INTO {tabela['silver']} ({', '.join(bloco.columns)}) VALUES %s",
             linhas,
         )
+
+        # Conta e mostra quantas linhas já foram gravadas
         total += len(linhas)
         print(f"   {total} linhas gravadas")
+
     return total
 
 
-# ESSA FUNÇÃO:
-# Serve para verificar se os dados da camada Raw foram carregados corretamente na camada Silver.
-# Ela faz algumas comparações entre as duas camadas para identificar possíveis problemas na carga: 
-# quantidade de linhas, datas vazias e soma dos valores dos pagamentos.
+# ---------------------------------------------------------------------------
+# Conferência dos dados
+# ---------------------------------------------------------------------------
 
 def conferir(conexao):
-    """Compara Raw x Silver: mesma quantidade de linhas, mesmos vazios e mesma soma de valores."""
+    """Compara alguns dados da Raw com a Silver para verificar a carga."""
+
     cursor = conexao.cursor()
 
     def um_valor(sql):
+        # Executa a consulta e retorna o primeiro valor encontrado
         cursor.execute(sql)
-        return cursor.fetchone()[0] # Acessa o primeiro elemento da primeira linha retornada na consulta
+        return cursor.fetchone()[0]
 
     conferencias = []
+
+    # Compara a quantidade de linhas de cada tabela
     for tabela in TABELAS:
         conferencias.append((
             f"linhas {tabela['raw']} x {tabela['silver']}",
             um_valor(f"SELECT COUNT(*) FROM {tabela['raw']}"),
             um_valor(f"SELECT COUNT(*) FROM {tabela['silver']}"),
         ))
+
+    # Confere se as datas vazias da Raw viraram NULL na Silver
     conferencias.append((
         "datas de emissão vazias (Raw) x NULL (Silver)",
         um_valor("SELECT COUNT(*) FROM raw_passagem WHERE data_emissao = ''"),
         um_valor("SELECT COUNT(*) FROM silver_passagem WHERE data_emissao IS NULL"),
     ))
+
+    # Confere se a soma dos pagamentos continua igual após a conversão
     conferencias.append((
         "soma dos pagamentos Raw x Silver",
         um_valor("SELECT SUM(REPLACE(NULLIF(valor, ''), ',', '.')::NUMERIC) FROM raw_pagamento"),
         um_valor("SELECT SUM(valor) FROM silver_pagamento"),
     ))
 
+    # Mostra se cada conferência passou ou encontrou diferença
     print("\nConferência Raw x Silver:")
     for descricao, origem, destino in conferencias:
         situacao = "OK" if origem == destino else "DIFERENTE!"
@@ -214,27 +251,36 @@ def conferir(conexao):
 # Execução
 # ---------------------------------------------------------------------------
 
-
 conexao = None
+
 try:
+    # Conecta ao banco de dados
     conexao = conectar()
     cursor = conexao.cursor()
 
-    # Esvazia a Silver: mãe e filhas no MESMO comando (exigência da FOREIGN KEY)
+    # Limpa as tabelas Silver antes de carregar novamente
+    # As tabelas são esvaziadas juntas por causa das chaves estrangeiras
     cursor.execute(
         "TRUNCATE silver_pagamento, silver_passagem, silver_trecho, silver_viagem RESTART IDENTITY"
     )
 
+    # Transforma e carrega cada tabela na ordem configurada
     for tabela in TABELAS:
         print(f"\nTransformando {tabela['raw']} -> {tabela['silver']}...")
         carregar_silver(conexao, tabela)
 
+    # Confirma as alterações e verifica se os dados estão corretos
     conexao.commit()
     conferir(conexao)
+
 except Exception as erro:
     if conexao:
+        # Desfaz as alterações que ainda não foram confirmadas
         conexao.rollback()
+
     print(f"\nERRO na transformação: {type(erro).__name__}: {erro}")
+
 finally:
     if conexao:
+        # Fecha a conexão ao terminar
         conexao.close()
